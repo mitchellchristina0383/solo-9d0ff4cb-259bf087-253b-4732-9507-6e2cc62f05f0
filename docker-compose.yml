@@ -27,6 +27,9 @@ services:
       LEASE_TTL: "2"
       HEARTBEAT_INTERVAL: "0.7"
       FAILURE_COOLDOWN: "3"
+      ISOLATION_SECONDS: "10"
+      PROBE_TTL: "5"
+      REPORT_TTL: "30"
     volumes:
       - cache-shared:/shared
     ports:
@@ -51,6 +54,9 @@ services:
       LEASE_TTL: "2"
       HEARTBEAT_INTERVAL: "0.7"
       FAILURE_COOLDOWN: "3"
+      ISOLATION_SECONDS: "10"
+      PROBE_TTL: "5"
+      REPORT_TTL: "30"
     volumes:
       - cache-shared:/shared
     ports:

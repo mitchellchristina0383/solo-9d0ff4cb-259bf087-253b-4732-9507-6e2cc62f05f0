@@ -25,11 +25,13 @@ trap stop EXIT
 SRC_PID=$!
 
 SOURCE_BASE="http://127.0.0.1:8080" INSTANCE_ID=cache1 \
+ISOLATION_SECONDS=10 PROBE_TTL=5 REPORT_TTL=30 \
 "$PY" -m uvicorn app.cache:app --host 127.0.0.1 --port 8081 \
   >"$LOG/cache1.log" 2>&1 &
 C1_PID=$!
 
 SOURCE_BASE="http://127.0.0.1:8080" INSTANCE_ID=cache2 \
+ISOLATION_SECONDS=10 PROBE_TTL=5 REPORT_TTL=30 \
 "$PY" -m uvicorn app.cache:app --host 127.0.0.1 --port 8082 \
   >"$LOG/cache2.log" 2>&1 &
 C2_PID=$!

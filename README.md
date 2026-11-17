@@ -52,6 +52,20 @@
    `GET /snapshots/{service}` 与 `/snapshots/{service}/revisions/{r}` 在源故障期间仍可读。
    源整体宕机时，已有有效快照的服务降级返回（`degraded=true`），无快照才 503。
 
+6. **故障节点选点隔离（`POST /pick/{service}` + `POST /reports`）**
+   调用方先选点拿到目标节点与一次性回报凭据，连接后回报成败：
+
+   - 回报 `failure` 的节点进入隔离（默认 10 秒，`ISOLATION_SECONDS` 可调），
+     隔离期内两个实例的选点都不会再返回它；所有节点都不可选时明确 `503`
+     （body 带 `retry_after` 与逐节点状态）。
+   - 隔离期满后进入 half-open：**两个缓存实例合计对该节点最多放行一个试探请求**
+     （`kind=probe`，由共享 SQLite 的条件 UPDATE 行锁保证），其余请求顺延或 503。
+   - 试探回报 `success` 才恢复常规选点；回报 `failure` 继续隔离；
+     试探在 `PROBE_TTL`（默认 5 秒）内无人回报而超时，节点立即重新取得试探资格。
+   - 陈旧回报防护：凭据一次性，重复回报返回 `reason=duplicate` 且不改状态；
+     每次试探代次（probe_epoch）递增，旧试探的迟到回报返回 `reason=stale`；
+     节点状态按修订分行，旧修订的迟到回报返回 `reason=stale_revision`，不影响新修订。
+
 ## 运行
 
 ### Docker Compose（目标部署方式）
@@ -80,13 +94,20 @@ bash scripts/run_local.sh
 2. cache `/docs` → `GET /routes/payments` 查询，观察 `revision / nodes / from_cache / served_by`
 3. source → `POST /admin/fault` 设 `{"mode":"delay","delay":2}` 模拟慢响应；
    `error` 模拟 5xx；`hang` 模拟挂起；`ok` 恢复
-4. cache → `GET /debug/state` 看 inflight 租约、failures 冷却、snapshots 状态
+4. cache → `GET /debug/state` 看 inflight 租约、failures 冷却、snapshots、node_states 与凭据
 5. cache → `GET /snapshots/payments` 看全部历史快照（含 stale）
+6. 选点与回报闭环（两个 cache 实例共享同一状态，对任一实例调用都一致）：
+   - `POST /pick/payments` 拿到 `node` 与一次性 `token`（`kind=normal`）
+   - 模拟连接失败：`POST /reports`，body `{"token":"...","outcome":"failure"}`
+   - 再次 `POST /pick/payments`：故障节点不再被选中；重复多次直到返回 `503`
+   - 等待隔离期满（默认 10 秒）后再选点：返回 `kind=probe` 的唯一试探
+   - `outcome=success` 回报后节点恢复 `healthy`，选点回到 `normal`
 
 ## 自测
 
 ```bash
-.venv/bin/python -I tests/test_integration.py   # 13 项：修订一致性/并发合并/接管/跨修订/故障
+.venv/bin/python -I tests/test_integration.py   # 原有 13 项：修订一致性/并发合并/接管/跨修订/故障
+.venv/bin/python -I tests/test_pick.py          # 选点 17 项：隔离/唯一试探/超时/陈旧回报/幂等/并发
 .venv/bin/python -I tests/test_edge.py          # 边界：源宕机降级、404、发布交错单调性
 ```
 
@@ -101,3 +122,7 @@ bash scripts/run_local.sh
 | `LEASE_TTL` | `2` | 租约有效期秒数 |
 | `HEARTBEAT_INTERVAL` | `0.7` | 续租间隔秒数 |
 | `FAILURE_COOLDOWN` | `3` | 失败冷却秒数 |
+| `ISOLATION_SECONDS` | `10` | 故障节点隔离时长 |
+| `PROBE_TTL` | `5` | 试探凭据有效期；无人回报期满后节点重新取得资格 |
+| `REPORT_TTL` | `30` | 常规选点凭据的回报有效期 |
+| `TOKEN_GRACE` | `300` | 过期凭据保留宽限，期内迟到回报可识别为 stale 而非 404 |

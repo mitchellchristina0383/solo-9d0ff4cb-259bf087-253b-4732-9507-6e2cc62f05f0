@@ -14,6 +14,11 @@ SQLite 的行级事务协调"跨实例并发未命中合并（singleflight）"�
    过期修订只标记为 stale，绝不作为有效缓存。
 5. 回源失败明确 503：失败记录带冷却期，冷却期内快速失败；旧快照
    仍可通过 /snapshots 与故障响应中的 last_good 排障。
+6. 故障节点选点隔离（/pick + /reports）：失败节点隔离 10 秒；隔离期满后
+   两个缓存实例合计最多放行一个试探请求，试探成功才恢复常规选点，失败则
+   继续隔离；试探无人回报而超时也会重新取得资格。凭据（token）一次性、
+   试探带代次（epoch），迟到回报/重复回报/旧修订回报都不能改写当前状态；
+   没有可选节点时明确返回 503。
 """
 from __future__ import annotations
 
@@ -27,7 +32,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 DB_PATH = os.environ.get("CACHE_DB", "/data/cache.db")
 SOURCE_BASE = os.environ.get("SOURCE_BASE", "http://source:8080")
@@ -37,6 +42,10 @@ LEASE_TTL = float(os.environ.get("LEASE_TTL", "2.0"))
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "0.7"))
 FAILURE_COOLDOWN = float(os.environ.get("FAILURE_COOLDOWN", "3.0"))
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "0.15"))
+# 选点隔离：失败节点隔离时长；隔离期满后允许一次跨实例唯一的试探
+ISOLATION_SECONDS = float(os.environ.get("ISOLATION_SECONDS", "10.0"))
+# 试探凭据有效期：无人回报时，期满后节点重新取得试探资格
+PROBE_TTL = float(os.environ.get("PROBE_TTL", "5.0"))
 
 
 def _connect() -> sqlite3.Connection:
@@ -84,6 +93,56 @@ def init_db() -> None:
             error      TEXT NOT NULL,
             cooldown_until REAL NOT NULL,
             updated_at REAL NOT NULL,
+            PRIMARY KEY (service, revision)
+        )
+        """
+    )
+    # 选点隔离状态：按 (service, revision, node) 分行。
+    # 新修订使用全新的一组行，旧修订的迟到回报天然无法触及新修订状态。
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS node_states (
+            service    TEXT NOT NULL,
+            revision   INTEGER NOT NULL,
+            node       TEXT NOT NULL,
+            state      TEXT NOT NULL,            -- healthy | isolated | probing
+            isolated_until  REAL,                -- isolated: 隔离期满时刻
+            probe_expires_at REAL,               -- probing: 试探超时时刻
+            probe_epoch INTEGER NOT NULL DEFAULT 0,  -- 每次发起试探 +1，用于识别旧试探迟到回报
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (service, revision, node)
+        )
+        """
+    )
+    # 回报凭据：一次性。重复回报时 token 已 reported，不再改变节点状态。
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pick_tokens (
+            token      TEXT PRIMARY KEY,
+            service    TEXT NOT NULL,
+            revision   INTEGER NOT NULL,
+            node       TEXT NOT NULL,
+            kind       TEXT NOT NULL,            -- normal | probe
+            probe_epoch INTEGER NOT NULL,        -- 发凭据时节点的试探代次
+            issued_by  TEXT NOT NULL,
+            issued_at  REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            reported   INTEGER NOT NULL DEFAULT 0,
+            outcome    TEXT,                     -- success | failure（回报后落档）
+            reported_at REAL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pick_tokens_svc ON pick_tokens(service, revision)"
+    )
+    # 常规选点的轮转游标（按修订快照的节点排序取模，保证多实例下均匀）
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pick_cursors (
+            service  TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            counter  INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (service, revision)
         )
         """
@@ -498,6 +557,344 @@ async def _wait_as_follower(
 
 
 # ---------------------------------------------------------------------------
+# 选点与回报：故障节点隔离 + 跨实例唯一试探（half-open）
+#
+# 节点状态机（每个 (service, revision, node) 一行）：
+#   healthy --failure 回报--> isolated --隔离期满, 首个选点请求--> probing
+#   probing --success 回报--> healthy（恢复常规选点）
+#   probing --failure 回报--> isolated（继续隔离，刷新窗口）
+#   probing --超时无人回报--> isolated（重新取得下一轮试探资格）
+#
+# 并发与陈旧回报防护：
+#   - 选点在 BEGIN IMMEDIATE 事务内做条件 UPDATE，两个实例共享同一写锁，
+#     同一节点隔离期满后合计只有一个请求能把它转成 probing（最多一个试探）。
+#   - 每次发起试探 probe_epoch+1；回报凭据记录发凭据时的 epoch，
+#     旧试探的迟到回报 epoch 不符，绝不改写当前状态。
+#   - 凭据一次性：重复回报时 token 已 reported，直接返回 duplicate 且不改状态。
+#   - 节点状态按修订分行：旧修订的迟到回报只作用于旧修订行，新修订不受影响。
+# ---------------------------------------------------------------------------
+REPORT_TTL = float(os.environ.get("REPORT_TTL", "30.0"))
+# 过期凭据保留宽限期：期内的迟到回报仍可被识别为陈旧回报（applied=false），
+# 而不是与"从未签发的伪造凭据"混为 404；超宽限才物理清理，限制表增长。
+TOKEN_GRACE = float(os.environ.get("TOKEN_GRACE", "300.0"))
+
+
+def _expire_probes(conn: sqlite3.Connection, service: str, revision: int, now: float) -> None:
+    """超时无人回报的试探：退回 isolated 并立即重新取得试探资格。
+
+    isolated_until 直接取试探的过期时刻（已在过去）：下次选点即可再次放行试探，
+    不需要再等一个完整隔离窗口；失败回报造成的隔离仍使用完整 ISOLATION_SECONDS。
+    """
+    conn.execute(
+        "UPDATE node_states SET state='isolated', isolated_until=probe_expires_at, "
+        "probe_expires_at=NULL, updated_at=? "
+        "WHERE service=? AND revision=? AND state='probing' AND probe_expires_at<=?",
+        (now, service, revision, now),
+    )
+
+
+def _ensure_node_rows(
+    conn: sqlite3.Connection, service: str, revision: int, nodes: list[str], now: float
+) -> None:
+    """为修订快照中的节点补齐状态行；已存在的行（含隔离状态）绝不覆盖。"""
+    for node in nodes:
+        conn.execute(
+            "INSERT INTO node_states(service, revision, node, state, updated_at) "
+            "VALUES(?,?,?, 'healthy', ?) "
+            "ON CONFLICT(service, revision, node) DO NOTHING",
+            (service, revision, node, now),
+        )
+
+
+def _node_state_payload(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    return [
+        {
+            "node": r["node"],
+            "state": r["state"],
+            "isolated_until": r["isolated_until"],
+            "probe_expires_at": r["probe_expires_at"],
+            "probe_epoch": r["probe_epoch"],
+        }
+        for r in rows
+    ]
+
+
+async def _pick(service: str) -> dict[str, Any]:
+    # 复用既有路由查询：自动获得修订单调、降级（degraded）与明确 503/404 行为
+    route = await _query(service)
+    revision = int(route["revision"])
+    nodes = list(route["nodes"])
+    now = time.time()
+
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        # 物理清理超出宽限期的旧凭据；宽限期内的过期凭据仍可识别陈旧回报
+        conn.execute("DELETE FROM pick_tokens WHERE expires_at<=?", (now - TOKEN_GRACE,))
+        _ensure_node_rows(conn, service, revision, nodes, now)
+        _expire_probes(conn, service, revision, now)
+
+        # 选点优先级：隔离期满可试探的节点 > healthy 常规节点 > 503。
+        # 试探优先保证短暂失败的节点不会因其他节点一直 healthy 而永久失去恢复机会；
+        # 同一节点的试探在途时不会被重复放行（条件 UPDATE + 循环内重读）。
+        chosen: sqlite3.Row | None = None
+        kind = ""
+        while True:
+            rows = conn.execute(
+                "SELECT * FROM node_states WHERE service=? AND revision=?",
+                (service, revision),
+            ).fetchall()
+            healthy = [r for r in rows if r["state"] == "healthy"]
+            probeable = [
+                r for r in rows
+                if r["state"] == "isolated" and r["isolated_until"] is not None
+                and r["isolated_until"] <= now
+            ]
+
+            if probeable:
+                # half-open：隔离期满，两实例合计每节点最多放行一个试探。
+                # 条件 UPDATE 行级竞争：只有一个事务能把该行转成 probing。
+                candidate = sorted(
+                    probeable, key=lambda r: (r["isolated_until"], r["node"])
+                )[0]
+                cur = conn.execute(
+                    "SELECT * FROM node_states WHERE service=? AND revision=? AND node=?",
+                    (service, revision, candidate["node"]),
+                ).fetchone()
+                next_epoch = int(cur["probe_epoch"]) + 1
+                probe_deadline = now + PROBE_TTL
+                conn.execute(
+                    "UPDATE node_states SET state='probing', probe_expires_at=?, "
+                    "probe_epoch=?, isolated_until=NULL, updated_at=? "
+                    "WHERE service=? AND revision=? AND node=? AND state='isolated' "
+                    "AND isolated_until<=?",
+                    (probe_deadline, next_epoch, now,
+                     service, revision, candidate["node"], now),
+                )
+                if conn.execute("SELECT changes() AS n").fetchone()["n"] == 1:
+                    chosen = conn.execute(
+                        "SELECT * FROM node_states WHERE service=? AND revision=? AND node=?",
+                        (service, revision, candidate["node"]),
+                    ).fetchone()
+                    kind = "probe"
+                    break
+                # 抢输（另一实例刚放行该节点的试探）：循环重读，尝试下一候选
+                continue
+
+            if healthy:
+                # 常规选点：按快照节点排序的轮转游标均匀分发
+                cur = conn.execute(
+                    "SELECT counter FROM pick_cursors WHERE service=? AND revision=?",
+                    (service, revision),
+                ).fetchone()
+                counter = int(cur["counter"]) if cur else 0
+                ordered = sorted(healthy, key=lambda r: r["node"])
+                chosen = ordered[counter % len(ordered)]
+                conn.execute(
+                    "INSERT INTO pick_cursors(service, revision, counter) VALUES(?,?,1) "
+                    "ON CONFLICT(service, revision) DO UPDATE SET counter=counter+1",
+                    (service, revision),
+                )
+                kind = "normal"
+                break
+
+            # 全部隔离中或试探在途：没有可选节点
+            states = _node_state_payload(rows)
+            wait_times = [
+                (r["isolated_until"] - now)
+                for r in rows
+                if r["state"] == "isolated" and r["isolated_until"] is not None
+                and r["isolated_until"] > now
+            ] + [
+                (r["probe_expires_at"] - now)
+                for r in rows
+                if r["state"] == "probing" and r["probe_expires_at"] is not None
+                and r["probe_expires_at"] > now
+            ]
+            retry_after = round(max(min(wait_times), 0.0), 2) if wait_times else 0.0
+            conn.rollback()
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "no eligible node: all nodes isolated or under probe",
+                    "service": service,
+                    "revision": revision,
+                    "retry_after": retry_after,
+                    "node_states": states,
+                },
+            )
+
+        token = uuid.uuid4().hex
+        token_expiry = (
+            float(chosen["probe_expires_at"]) if kind == "probe" else now + REPORT_TTL
+        )
+        conn.execute(
+            "INSERT INTO pick_tokens(token, service, revision, node, kind, probe_epoch, "
+            "issued_by, issued_at, expires_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                token, service, revision, chosen["node"], kind,
+                int(chosen["probe_epoch"]), INSTANCE_ID, now, token_expiry,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "service": service,
+        "revision": revision,
+        "node": chosen["node"],
+        "token": token,
+        "kind": kind,
+        "probe": kind == "probe",
+        "isolation_seconds": ISOLATION_SECONDS,
+        "served_by": INSTANCE_ID,
+        "issued_at": now,
+        "expires_at": token_expiry,
+    }
+
+
+async def _report(token: str, outcome: str) -> dict[str, Any]:
+    now = time.time()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM pick_tokens WHERE token=?", (token,)
+        ).fetchone()
+        if row is None:
+            # 仅伪造凭据或已超出宽限期被物理清理的凭据才到这里
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "unknown token", "token": token},
+            )
+
+        # 幂等：同一凭据重复回报不再改变任何状态
+        if row["reported"]:
+            return {
+                "applied": False,
+                "reason": "duplicate",
+                "service": row["service"],
+                "revision": row["revision"],
+                "node": row["node"],
+                "outcome": row["outcome"],
+                "state": _current_node_state(
+                    conn, row["service"], row["revision"], row["node"]
+                ),
+            }
+
+        # 凭据已过有效期（试探窗口关闭、节点状态已推进）：迟到回报一律视为陈旧
+        token_expired = row["expires_at"] <= now
+
+        # 尽力核对修订：源不可达不影响回报（结构上新旧修订也是分行的）
+        stale_revision = False
+        try:
+            current = await _source_current(row["service"])
+            stale_revision = current != row["revision"]
+        except (SourceUnavailable, HTTPException):
+            stale_revision = False
+
+        conn.execute("BEGIN IMMEDIATE")
+        # 事务内重读，防止与并发回报交错
+        row = conn.execute(
+            "SELECT * FROM pick_tokens WHERE token=?", (token,)
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail={"error": "token vanished"})
+        if row["reported"]:
+            conn.rollback()
+            return {
+                "applied": False,
+                "reason": "duplicate",
+                "service": row["service"],
+                "revision": row["revision"],
+                "node": row["node"],
+                "outcome": row["outcome"],
+                "state": _current_node_state(
+                    conn, row["service"], row["revision"], row["node"]
+                ),
+            }
+
+        reason = "applied"
+        applied = False
+        node_row = conn.execute(
+            "SELECT * FROM node_states WHERE service=? AND revision=? AND node=?",
+            (row["service"], row["revision"], row["node"]),
+        ).fetchone()
+
+        # 凭据与当前节点状态一致才允许落状态：
+        #   probe 凭据：节点须仍处于同一代次的 probing（未超时、未被新试探取代）
+        #   normal 凭据：节点须仍为 healthy 且代次未变（未被其他回报隔离）
+        expected_state = "probing" if row["kind"] == "probe" else "healthy"
+        if stale_revision:
+            # 旧修订的迟到回报：只销票，绝不触碰新修订状态
+            reason = "stale_revision"
+        elif (
+            token_expired
+            or node_row is None
+            or int(node_row["probe_epoch"]) != int(row["probe_epoch"])
+            or node_row["state"] != expected_state
+        ):
+            # 凭据过期 / 旧试探 / 超时试探 / 状态已推进后的迟到回报：不改写当前结果
+            reason = "stale"
+        else:
+            applied = True
+            if outcome == "success":
+                # 试探成功才恢复常规选点；常规节点的成功回报保持 healthy
+                conn.execute(
+                    "UPDATE node_states SET state='healthy', isolated_until=NULL, "
+                    "probe_expires_at=NULL, updated_at=? "
+                    "WHERE service=? AND revision=? AND node=?",
+                    (now, row["service"], row["revision"], row["node"]),
+                )
+            else:
+                # 失败（含试探失败）：隔离 10 秒，试探中的节点继续隔离
+                conn.execute(
+                    "UPDATE node_states SET state='isolated', isolated_until=?, "
+                    "probe_expires_at=NULL, updated_at=? "
+                    "WHERE service=? AND revision=? AND node=?",
+                    (now + ISOLATION_SECONDS, now,
+                     row["service"], row["revision"], row["node"]),
+                )
+
+        conn.execute(
+            "UPDATE pick_tokens SET reported=1, outcome=?, reported_at=? WHERE token=?",
+            (outcome, now, token),
+        )
+        conn.commit()
+        state = _current_node_state(conn, row["service"], row["revision"], row["node"])
+        return {
+            "applied": applied,
+            "reason": reason,
+            "service": row["service"],
+            "revision": row["revision"],
+            "node": row["node"],
+            "outcome": outcome,
+            "state": state,
+        }
+    finally:
+        conn.close()
+
+
+def _current_node_state(
+    conn: sqlite3.Connection, service: str, revision: int, node: str
+) -> dict[str, Any] | None:
+    r = conn.execute(
+        "SELECT * FROM node_states WHERE service=? AND revision=? AND node=?",
+        (service, revision, node),
+    ).fetchone()
+    if r is None:
+        return None
+    return {
+        "node": r["node"],
+        "state": r["state"],
+        "isolated_until": r["isolated_until"],
+        "probe_expires_at": r["probe_expires_at"],
+        "probe_epoch": r["probe_epoch"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # FastAPI
 # ---------------------------------------------------------------------------
 app = FastAPI(
@@ -527,9 +924,62 @@ class QueryResult(BaseModel):
     snapshot_status: str | None = None
 
 
+class PickResult(BaseModel):
+    service: str
+    revision: int
+    node: str
+    token: str
+    kind: str  # normal | probe
+    probe: bool
+    isolation_seconds: float
+    served_by: str
+    issued_at: float
+    expires_at: float
+
+
+class ReportRequest(BaseModel):
+    token: str = Field(..., description="选点 API 返回的一次性回报凭据")
+    outcome: str = Field(
+        ..., description="连接结果：success=连接成功；failure=连接失败"
+    )
+
+
+class ReportResult(BaseModel):
+    applied: bool
+    reason: str  # applied | duplicate | stale | stale_revision
+    service: str
+    revision: int
+    node: str
+    outcome: str
+    state: dict[str, Any] | None = None
+
+
 @app.get("/routes/{service}", response_model=QueryResult, summary="查询服务当前路由（含修订）")
 async def query_route(service: str) -> dict[str, Any]:
     return await _query(service)
+
+
+@app.post(
+    "/pick/{service}",
+    response_model=PickResult,
+    summary="选点：返回一个目标节点与一次性回报凭据（自动隔离故障节点）",
+)
+async def pick_node(service: str) -> dict[str, Any]:
+    return await _pick(service)
+
+
+@app.post(
+    "/reports",
+    response_model=ReportResult,
+    summary="回报连接成败（凭据一次性；陈旧/重复回报不改写当前状态）",
+)
+async def report_connection(req: ReportRequest) -> dict[str, Any]:
+    if req.outcome not in {"success", "failure"}:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "outcome must be 'success' or 'failure'"},
+        )
+    return await _report(req.token, req.outcome)
 
 
 @app.get("/snapshots/{service}", summary="列出该服务全部缓存快照（含 stale，供排障）")
@@ -577,7 +1027,7 @@ async def get_snapshot(service: str, revision: int) -> dict[str, Any]:
         conn.close()
 
 
-@app.get("/debug/state", summary="共享数据库内部状态（inflight/failures/快照）")
+@app.get("/debug/state", summary="共享数据库内部状态（inflight/failures/快照/选点隔离）")
 async def debug_state() -> dict[str, Any]:
     conn = _connect()
     try:
@@ -600,12 +1050,30 @@ async def debug_state() -> dict[str, Any]:
                 "ORDER BY service, revision"
             ).fetchall()
         ]
+        node_states = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT service, revision, node, state, isolated_until, "
+                "probe_expires_at, probe_epoch, updated_at FROM node_states "
+                "ORDER BY service, revision, node"
+            ).fetchall()
+        ]
+        tokens = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT token, service, revision, node, kind, probe_epoch, issued_by, "
+                "issued_at, expires_at, reported, outcome, reported_at FROM pick_tokens "
+                "ORDER BY issued_at DESC LIMIT 100"
+            ).fetchall()
+        ]
         return {
             "instance_id": INSTANCE_ID,
             "now": time.time(),
             "inflight": inflight,
             "failures": failures,
             "snapshots": snaps,
+            "node_states": node_states,
+            "pick_tokens": tokens,
         }
     finally:
         conn.close()
@@ -618,6 +1086,9 @@ async def debug_reset() -> dict[str, Any]:
         conn.execute("DELETE FROM snapshots")
         conn.execute("DELETE FROM inflight")
         conn.execute("DELETE FROM failures")
+        conn.execute("DELETE FROM node_states")
+        conn.execute("DELETE FROM pick_tokens")
+        conn.execute("DELETE FROM pick_cursors")
     finally:
         conn.close()
     return {"reset": True, "by": INSTANCE_ID}
